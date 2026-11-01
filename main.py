@@ -15,9 +15,10 @@ def setup_argparse():
     parser.add_argument("domain", help="The domain name to check.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     parser.add_argument("-o", "--output", help="Output file to save results to (optional).", metavar="FILE")
+    parser.add_argument("--timeout", type=int, default=30, help="Timeout in seconds for the WHOIS query (default: 30).")
     return parser
 
-def get_domain_age(domain):
+def get_domain_age(domain, timeout=30):
     """
     Queries the WHOIS database and calculates the age of the domain.
 
@@ -29,29 +30,33 @@ def get_domain_age(domain):
                Returns (None, None) if there's an error.
     """
     try:
-        w = whois.whois(domain)
+        w = whois.whois(domain, timeout=timeout)
 
         if w.creation_date:
             creation_date = w.creation_date
             if isinstance(creation_date, list): # Handle multiple creation dates, taking the earliest.
-              # Taking the earliest of several reported dates is the conservative choice for spotting new domains, since a registrar that reports both a transfer date and the original registration would otherwise make an old name look fresh. The list handling further down is dead weight after this line, because min has already reduced the list to one value.
+              # Taking the earliest of several reported dates is the conservative choice for spotting new domains, since a registrar that reports both a transfer date and the original registration would otherwise make an old name look fresh. An earlier version carried a second list branch below this line that could never run, because min has already reduced the list to one value; that dead branch was removed with the future date fix.
               creation_date = min(creation_date)
 
             if not isinstance(creation_date, datetime.datetime):
-                if isinstance(creation_date, list) and len(creation_date) > 0:
-                    creation_date = creation_date[0] # take the first if list
-                if not isinstance(creation_date, datetime.datetime):
-                    logging.warning(f"Unexpected creation_date type: {type(creation_date)}. Attempting conversion.")
+                logging.warning(f"Unexpected creation_date type: {type(creation_date)}. Attempting conversion.")
+                try:
+                    creation_date = datetime.datetime.strptime(str(creation_date), '%Y-%m-%d %H:%M:%S')
+                except (ValueError, TypeError):
                     try:
-                        creation_date = datetime.datetime.strptime(str(creation_date), '%Y-%m-%d %H:%M:%S')
+                         creation_date = datetime.datetime.strptime(str(creation_date).split(' ')[0], '%Y-%m-%d')
                     except (ValueError, TypeError):
-                        try:
-                             creation_date = datetime.datetime.strptime(str(creation_date).split(' ')[0], '%Y-%m-%d')
-                        except (ValueError, TypeError):
-                            logging.error(f"Could not convert creation_date: {creation_date}")
-                            return None, None
+                        logging.error(f"Could not convert creation_date: {creation_date}")
+                        return None, None
 
-            # now() here is naive local time. A creation date that arrives timezone aware from the whois library raises TypeError on this subtraction, and the generic handler below turns that into the same no result as a failed query. A date in the future, which bad whois data does produce, yields a negative age that main prints as is.
+            if creation_date.tzinfo is not None:
+                creation_date = creation_date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+            if creation_date > datetime.datetime.now():
+                logging.error(f"Invalid WHOIS data for {domain}: registration date {creation_date} is in the future.")
+                return None, None
+
+            # now() here is naive local time, which is safe at this point: aware creation dates are converted to naive UTC above, and a future creation date has already been rejected above as invalid data instead of yielding a negative age.
             age_in_days = (datetime.datetime.now() - creation_date).days
             return creation_date, age_in_days
         else:
@@ -86,7 +91,7 @@ def main():
 
 
     logging.info(f"Checking domain age for: {domain}")
-    creation_date, age_in_days = get_domain_age(domain)
+    creation_date, age_in_days = get_domain_age(domain, timeout=args.timeout)
 
     if creation_date and age_in_days is not None:
         print(f"Domain: {domain}")
