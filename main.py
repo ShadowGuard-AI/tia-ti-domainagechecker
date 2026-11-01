@@ -34,6 +34,7 @@ def get_domain_age(domain):
         if w.creation_date:
             creation_date = w.creation_date
             if isinstance(creation_date, list): # Handle multiple creation dates, taking the earliest.
+              # Taking the earliest of several reported dates is the conservative choice for spotting new domains, since a registrar that reports both a transfer date and the original registration would otherwise make an old name look fresh. The list handling further down is dead weight after this line, because min has already reduced the list to one value.
               creation_date = min(creation_date)
 
             if not isinstance(creation_date, datetime.datetime):
@@ -50,6 +51,7 @@ def get_domain_age(domain):
                             logging.error(f"Could not convert creation_date: {creation_date}")
                             return None, None
 
+            # now() here is naive local time. A creation date that arrives timezone aware from the whois library raises TypeError on this subtraction, and the generic handler below turns that into the same no result as a failed query. A date in the future, which bad whois data does produce, yields a negative age that main prints as is.
             age_in_days = (datetime.datetime.now() - creation_date).days
             return creation_date, age_in_days
         else:
@@ -98,6 +100,7 @@ def main():
                     f.write(f"Registration Date: {creation_date}\n")
                     f.write(f"Age (days): {age_in_days}\n")
                 logging.info(f"Results saved to {args.output}")
+            # A failed save is logged and nothing else happens: the results are already on screen, the process exits 0, and the caller who asked for a file has no file. The exit code only ever reports whether the lookup worked, never whether the output landed.
             except IOError as e:
                 logging.error(f"Error writing to file {args.output}: {e}")
     else:
