@@ -1,11 +1,48 @@
 import argparse
 import logging
+import re
 import whois
 import datetime
 import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+DOMAIN_RE = re.compile(
+    r'^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
+)
+
+
+def is_valid_domain(domain):
+    """
+    Validates the format of the input domain name against a strict
+    domain pattern, rejecting spaces, URL syntax, and other non-domain
+    input before any WHOIS query is made.
+    """
+    if not isinstance(domain, str) or not domain:
+        return False
+    return DOMAIN_RE.match(domain) is not None
+
+
+def _parse_creation_date(value):
+    """
+    Converts a WHOIS creation date value to a datetime, or returns
+    None when the value cannot be parsed. Accepts datetime objects
+    and ISO or common registry string forms.
+    """
+    if isinstance(value, datetime.datetime):
+        return value
+    text = str(value).strip()
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+        try:
+            return datetime.datetime.strptime(text.split(' ')[0] if fmt == '%Y-%m-%d' else text, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 def setup_argparse():
     """
@@ -33,31 +70,37 @@ def get_domain_age(domain, timeout=30):
         w = whois.whois(domain, timeout=timeout)
 
         if w.creation_date:
-            creation_date = w.creation_date
-            if isinstance(creation_date, list): # Handle multiple creation dates, taking the earliest.
-              # Taking the earliest of several reported dates is the conservative choice for spotting new domains, since a registrar that reports both a transfer date and the original registration would otherwise make an old name look fresh. An earlier version carried a second list branch below this line that could never run, because min has already reduced the list to one value; that dead branch was removed with the future date fix.
-              creation_date = min(creation_date)
-
-            if not isinstance(creation_date, datetime.datetime):
-                logging.warning(f"Unexpected creation_date type: {type(creation_date)}. Attempting conversion.")
-                try:
-                    creation_date = datetime.datetime.strptime(str(creation_date), '%Y-%m-%d %H:%M:%S')
-                except (ValueError, TypeError):
-                    try:
-                         creation_date = datetime.datetime.strptime(str(creation_date).split(' ')[0], '%Y-%m-%d')
-                    except (ValueError, TypeError):
-                        logging.error(f"Could not convert creation_date: {creation_date}")
-                        return None, None
+            # Handle multiple creation dates, taking the earliest.
+            # Taking the earliest of several reported dates is the
+            # conservative choice for spotting new domains, since a
+            # registrar that reports both a transfer date and the
+            # original registration would otherwise make an old name
+            # look fresh. Each entry is parsed before the minimum is
+            # taken, so string dates are handled the same way as
+            # datetime dates.
+            raw_dates = w.creation_date if isinstance(w.creation_date, list) else [w.creation_date]
+            parsed_dates = []
+            for raw in raw_dates:
+                converted = _parse_creation_date(raw)
+                if converted is None:
+                    logging.error(f"Could not convert creation_date: {raw}")
+                    return None, None
+                parsed_dates.append(converted)
+            creation_date = min(parsed_dates)
 
             if creation_date.tzinfo is not None:
                 creation_date = creation_date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
 
-            if creation_date > datetime.datetime.now():
+            # Aware creation dates are converted to naive UTC above, so
+            # the comparison point is the current UTC time, not local
+            # wall clock time. A future creation date is rejected above
+            # as invalid data instead of yielding a negative age.
+            now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            if creation_date > now:
                 logging.error(f"Invalid WHOIS data for {domain}: registration date {creation_date} is in the future.")
                 return None, None
 
-            # now() here is naive local time, which is safe at this point: aware creation dates are converted to naive UTC above, and a future creation date has already been rejected above as invalid data instead of yielding a negative age.
-            age_in_days = (datetime.datetime.now() - creation_date).days
+            age_in_days = (now - creation_date).days
             return creation_date, age_in_days
         else:
             logging.warning(f"No creation date found for {domain}.")
@@ -78,6 +121,9 @@ def main():
     parser = setup_argparse()
     args = parser.parse_args()
 
+    if args.timeout <= 0:
+        parser.error("--timeout must be a positive number of seconds.")
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("Verbose mode enabled.")
@@ -85,7 +131,7 @@ def main():
     domain = args.domain
 
     # Input validation
-    if not isinstance(domain, str) or not domain:
+    if not is_valid_domain(domain):
         logging.error("Invalid domain name. Please provide a valid domain.")
         sys.exit(1)
 
@@ -105,9 +151,11 @@ def main():
                     f.write(f"Registration Date: {creation_date}\n")
                     f.write(f"Age (days): {age_in_days}\n")
                 logging.info(f"Results saved to {args.output}")
-            # A failed save is logged and nothing else happens: the results are already on screen, the process exits 0, and the caller who asked for a file has no file. The exit code only ever reports whether the lookup worked, never whether the output landed.
             except IOError as e:
+                # A failed save exits non-zero: the caller asked for a
+                # file and has no file, so the run did not complete.
                 logging.error(f"Error writing to file {args.output}: {e}")
+                sys.exit(1)
     else:
         logging.error(f"Could not determine the age of the domain: {domain}")
         sys.exit(1)
